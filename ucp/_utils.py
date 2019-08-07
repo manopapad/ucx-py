@@ -59,6 +59,8 @@ def make_server(cuda_info=None):
 
         if cuda_info:
             import cupy
+            import numpy as np
+            nbytes = None
             if 'shape' in cuda_info:
                  # this is critical -- incoming shape is often
                  # the size of the buffer which is not the same
@@ -66,9 +68,9 @@ def make_server(cuda_info=None):
                 obj.shape = cuda_info['shape']
             if 'typestr' in cuda_info:
                 obj.typestr = cuda_info['typestr']
-            obj = cupy.asarray(obj)
+                nbytes = np.dtype(obj.__cuda_array_interface__['typestr']).itemsize * len(obj)
 
-        await ep.send_obj(obj)
+        await ep.send_obj(obj, nbytes=nbytes)
         destroy_ep(ep)
         stop_listener(lf)
 
