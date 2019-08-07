@@ -187,6 +187,9 @@ async def test_send_recv_into_cuda(size):
         lambda cudf: cudf.Series([1, 2, 3]),
         lambda cudf: cudf.Series([1, 2, 3], index=[4, 5, 6]),
         lambda cudf: cudf.Series([1, None, 3]),
+        lambda cudf: cudf.Series(range(2**13)),
+        lambda cudf: cudf.DataFrame({'a': range(2**20)}),
+        lambda cudf: cudf.DataFrame({'a': range(2**26)}),
     ]
 )
 async def test_send_recv_cudf(event_loop, g):
@@ -201,8 +204,10 @@ async def test_send_recv_cudf(event_loop, g):
     cdf = g(cudf)
 
     class UCX:
-        def __init__(self, ep):
+        def __init__(self, ep, uu=None):
             self.ep = ep
+            print(ep)
+            self.uu = uu
 
         async def write(self, cdf):
             header, _frames = cdf.serialize()
@@ -215,9 +220,17 @@ async def test_send_recv_cudf(event_loop, g):
 
             print("Sending meta...")
             await self.ep.send_obj(meta)
+            import cupy
+            data = cupy.arange(2**13)
+            print("SENDING CUPY!")
+            breakpoint()
+            await self.ep.send_obj(data)
+            print("FINISHED SENDING")
+            breakpoint()
             for idx, frame in enumerate(frames):
-                print("Sending frame: ", idx)
+                print("Sending frame: ", idx, nbytes(frame))
                 await self.ep.send_obj(frame)
+                print("Finished Sending...")
 
         async def read(self):
             await asyncio.sleep(1)
@@ -255,8 +268,12 @@ async def test_send_recv_cudf(event_loop, g):
                 ucx = UCX(ep)
                 self.comm = ucx
 
-            ucp.init()
-            loop = asyncio.get_event_loop()
+            self._is_init = ucp.init()
+            try:
+                loop = asyncio.get_running_loop()
+            except (RuntimeError, AttributeError):
+                print("getting event loop")
+                loop = asyncio.get_event_loop()
 
             self.ucp_server = ucp.start_listener(serve_forever,
                                           listener_port=13337,
@@ -268,14 +285,14 @@ async def test_send_recv_cudf(event_loop, g):
     uu.start()
     uu.address = ucp.get_address()
     uu.client = await ucp.get_endpoint(uu.address.encode(), 13337)
-    ucx = UCX(uu.client)
+    ucx = UCX(uu.client, uu)
     await ucx.write(cdf)
     await asyncio.sleep(1)
     frames = await uu.comm.read()
 
     ucx_header = pickle.loads(frames[0])
     ucx_index = bytes(frames[1])
-    original_devicendarray = cdf.to_gpu_array()
+    # original_devicendarray = cdf.to_gpu_array()
     cudf_buffer = frames[2:]
     ucx_received_frames = [ucx_index] + cudf_buffer
     typ = type(cdf)
@@ -329,3 +346,49 @@ async def test_send_recv_rmm(size, dtype):
     np.testing.assert_array_equal(msg, nn_result)
 
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [2**N for N in range(26,30)])
+async def test_send_recv_large_data(size):
+    # 2**26 * 8 bytes ~.5 GB
+    # 2**27 * 8 bytes ~1 GB
+    # 2**28 * 8 bytes ~2 GB
+    # 2**29 * 8 bytes ~4 GB
+
+    numba = pytest.importorskip('numba')
+    pytest.importorskip('numba.cuda')
+    import numpy as np
+    dtype = 'i8'
+
+    cuda_info = {
+        'shape': [size],
+        'typestr': dtype
+    }
+    import cupy
+    # msg = cupy.arange(size, dtype=dtype)
+    arr = np.arange(size)
+    msg = numba.cuda.to_device(arr)
+    print("Size in Bytes: ", msg.nbytes)
+    gpu_alloc_size = msg.dtype.itemsize * msg.size
+
+    async with echo_pair(cuda_info) as (_, client):
+        await client.send_obj(bytes(str(gpu_alloc_size), encoding='utf-8'))
+        await client.send_obj(msg)
+        resp = await client.recv_obj(gpu_alloc_size, cuda=True)
+        result = ucp.get_obj_from_msg(resp)
+
+    # assert hasattr(result, '__cuda_array_interface__')
+    # result.typestr = msg.__cuda_array_interface__['typestr']
+    # result.shape = msg.shape
+    # result = cupy.asarray(result)
+    # cupy.testing.assert_array_equal(msg, result)
+
+    assert hasattr(result, '__cuda_array_interface__')
+    result.typestr = msg.__cuda_array_interface__['typestr']
+    result.shape = msg.shape
+    breakpoint()
+    n_result = numba.cuda.as_cuda_array(result)
+    assert isinstance(n_result, numba.cuda.devicearray.DeviceNDArray)
+    nn_result = np.asarray(n_result, dtype=dtype)
+    msg = np.asarray(msg, dtype=dtype)
+    np.testing.assert_array_equal(msg, nn_result)

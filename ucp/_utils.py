@@ -53,7 +53,7 @@ def make_server(cuda_info=None):
 
         size_msg = await ep.recv_future()
         size = int(size_msg.get_obj())
-
+        breakpoint()
         msg = await ep.recv_obj(size, cuda=bool(cuda_info))
         obj = msg.get_obj()
 
