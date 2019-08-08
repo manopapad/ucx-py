@@ -109,22 +109,16 @@ def handle_msg(msg):
 
     l = []
     while -1 == ucp_py_worker_progress_wait():
-        print("INFINITE WAIT!")
-        # heartbeat (moves messages along)
         while 0 != ucp_py_worker_progress():
-            print("INFINITE PROGRESS!")
             pass
         dones = []
-        # go through all messages
         for m, ft in PENDING_MESSAGES.items():
             completed = m.check()
             if completed:
-                print("COMPLETED")
                 dones.append(m)
                 ft.set_result(m)
 
         for m in dones:
-            print("DONES!")
             PENDING_MESSAGES.pop(m)
 
     return fut
@@ -377,13 +371,10 @@ cdef class Endpoint:
 
         if nbytes is None:
             if hasattr(msg, 'nbytes'):
-                print("NBYTES")
                 nbytes = msg.nbytes
             elif hasattr(msg, 'dtype') and hasattr(msg, 'size'):
-                print("SIZE * DTYPE")
                 nbytes = msg.dtype.itemsize * msg.size
             else:
-                print("LEN")
                 nbytes = len(msg)
 
         internal_msg = Message(buf_reg, name=name, length=nbytes)
@@ -392,7 +383,6 @@ cdef class Endpoint:
         internal_msg.ctx_ptr = ucp_py_ep_send_nb(self.ep, internal_msg.buf, nbytes)
         internal_msg.comm_len = nbytes
         internal_msg.ctx_ptr_set = 1
-        print("GOT HERE", msg, nbytes)
         fut = handle_msg(internal_msg)
         return fut
 

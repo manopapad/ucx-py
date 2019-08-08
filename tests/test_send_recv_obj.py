@@ -204,10 +204,10 @@ async def test_send_recv_cudf(event_loop, g):
     cdf = g(cudf)
 
     class UCX:
-        def __init__(self, ep, uu=None):
+        def __init__(self, ep):
             self.ep = ep
-            print(ep)
-            self.uu = uu
+            loop = asyncio.get_event_loop()
+            self.queue = asyncio.Queue(loop=loop)
 
         async def write(self, cdf):
             header, _frames = cdf.serialize()
@@ -220,19 +220,15 @@ async def test_send_recv_cudf(event_loop, g):
 
             print("Sending meta...")
             await self.ep.send_obj(meta)
-            import cupy
-            data = cupy.arange(2**13)
-            print("SENDING CUPY!")
-            breakpoint()
-            await self.ep.send_obj(data)
-            print("FINISHED SENDING")
-            breakpoint()
             for idx, frame in enumerate(frames):
                 print("Sending frame: ", idx, nbytes(frame))
                 await self.ep.send_obj(frame)
                 print("Finished Sending...")
 
         async def read(self):
+            return await self.queue.get()
+
+        async def _read(self):
             await asyncio.sleep(1)
             print("Receiving frames...")
             resp = await self.ep.recv_future()
@@ -267,13 +263,11 @@ async def test_send_recv_cudf(event_loop, g):
                 print("starting server...")
                 ucx = UCX(ep)
                 self.comm = ucx
+                frames = await self.comm._read()
+                await self.comm.queue.put(frames)
 
-            self._is_init = ucp.init()
-            try:
-                loop = asyncio.get_running_loop()
-            except (RuntimeError, AttributeError):
-                print("getting event loop")
-                loop = asyncio.get_event_loop()
+            ucp.init()
+            loop = asyncio.get_event_loop()
 
             self.ucp_server = ucp.start_listener(serve_forever,
                                           listener_port=13337,
@@ -285,9 +279,9 @@ async def test_send_recv_cudf(event_loop, g):
     uu.start()
     uu.address = ucp.get_address()
     uu.client = await ucp.get_endpoint(uu.address.encode(), 13337)
-    ucx = UCX(uu.client, uu)
-    await ucx.write(cdf)
+    ucx = UCX(uu.client)
     await asyncio.sleep(1)
+    await ucx.write(cdf)
     frames = await uu.comm.read()
 
     ucx_header = pickle.loads(frames[0])
@@ -358,7 +352,7 @@ async def test_send_recv_large_data(size):
     numba = pytest.importorskip('numba')
     pytest.importorskip('numba.cuda')
     import numpy as np
-    dtype = 'i8'
+    dtype = 'f8'
 
     cuda_info = {
         'shape': [size],
@@ -367,8 +361,8 @@ async def test_send_recv_large_data(size):
     import cupy
     # msg = cupy.arange(size, dtype=dtype)
     arr = np.arange(size)
-    msg = numba.cuda.to_device(arr)
     print("Size in Bytes: ", msg.nbytes)
+    msg = numba.cuda.to_device(arr)
     gpu_alloc_size = msg.dtype.itemsize * msg.size
 
     async with echo_pair(cuda_info) as (_, client):
@@ -386,9 +380,82 @@ async def test_send_recv_large_data(size):
     assert hasattr(result, '__cuda_array_interface__')
     result.typestr = msg.__cuda_array_interface__['typestr']
     result.shape = msg.shape
-    breakpoint()
     n_result = numba.cuda.as_cuda_array(result)
     assert isinstance(n_result, numba.cuda.devicearray.DeviceNDArray)
     nn_result = np.asarray(n_result, dtype=dtype)
     msg = np.asarray(msg, dtype=dtype)
     np.testing.assert_array_equal(msg, nn_result)
+
+
+
+@pytest.mark.asyncio
+async def test_send_custom_ep(event_loop):
+    # requires numba=0.45 (.nbytes)
+    # or fix nbytes in distributed
+    import numpy as np
+    import cupy
+
+
+    class UCX:
+        def __init__(self, ep):
+            self.ep = ep
+            loop = asyncio.get_event_loop()
+            self.queue = asyncio.Queue(loop=loop)
+
+        async def write(self):
+            data = np.arange(10)
+            print("Sendinng NumPy data...")
+            # await self.ep.send_obj(data)
+            data = cupy.arange(2**12)
+            print("Sending Large CuPy Data")
+            # await asyncio.sleep(1)
+            await self.ep.send_obj(data)
+            print("Finished Sending...")
+
+        async def read(self):
+            return await self.queue.get()
+
+        async def _read(self):
+            await asyncio.sleep(1)
+            print("Receiving frames...")
+            resp = await self.ep.recv_future()
+            return resp
+
+    class UCXListener:
+        def __init__(self):
+           self.comm_handler = None
+
+        def start(self):
+            async def serve_forever(ep, li):
+                print("starting server...")
+                ucx = UCX(ep)
+                resp = await ucx._read()
+                await ucx.queue.put(resp)
+                self.comm = ucx
+
+            ucp.init()
+            loop = asyncio.get_event_loop()
+
+            self.ucp_server = ucp.start_listener(serve_forever,
+                                          listener_port=13337,
+                                          is_coroutine=True)
+            t = loop.create_task(self.ucp_server.coroutine)
+            self._t = t
+
+    uu = UCXListener()
+    uu.start()
+    uu.address = ucp.get_address()
+    uu.client = await ucp.get_endpoint(uu.address.encode(), 13337)
+    ucx = UCX(uu.client)
+    await asyncio.sleep(1)
+    await ucx.write()
+    await asyncio.sleep(1)
+    frames = await uu.comm.read()
+    breakpoint()
+
+    ucp.destroy_ep(uu.client)
+    ucp.stop_listener(uu.ucp_server)
+    ucp.fin()
+
+    # let UCP shutdown
+    time.sleep(1)
