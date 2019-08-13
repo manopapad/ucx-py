@@ -232,3 +232,114 @@ async def test_send_recv_python_things(thing):
         result = ucp.get_obj_from_msg(resp)
 
     assert result.tobytes() == msg
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", msg_sizes)
+@pytest.mark.parametrize("dtype", dtypes)
+async def test_send_recv_pandas_sr(size, dtype):
+    pd = pytest.importorskip('pandas')
+    np = pytest.importorskip('numpy')
+    data = np.arange(size, dtype=dtype)
+    sr = pd.Series(data)
+    msg = pickle.dumps(sr)
+    alloc_size = len(msg)
+
+    async with echo_pair() as (_, client):
+        print('Sending Metadata')
+        await client.send_obj(bytes(str(alloc_size), encoding='utf-8'))
+        print('Sending Pandas')
+        await client.send_obj(msg)
+        print('Receiving Data')
+        resp = await client.recv_obj(alloc_size)
+        result = ucp.get_obj_from_msg(resp)
+
+    res = pickle.loads(result)
+    pd.util.testing.assert_equal(res, sr)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", msg_sizes)
+@pytest.mark.parametrize("dtype", dtypes)
+async def test_send_recv_pandas_df(size, dtype):
+    pd = pytest.importorskip('pandas')
+    np = pytest.importorskip('numpy')
+    data = np.arange(size, dtype=dtype)
+    df = pd.DataFrame({'a': data, 'b': data})
+    msg = pickle.dumps(df)
+    alloc_size = len(msg)
+
+
+
+    async with echo_pair() as (_, client):
+        print('Sending Metadata')
+        await client.send_obj(bytes(str(alloc_size), encoding='utf-8'))
+        print('Sending Pandas')
+        await client.send_obj(msg)
+        print('Receiving Data')
+        resp = await client.recv_obj(alloc_size)
+        result = ucp.get_obj_from_msg(resp)
+
+    res = pickle.loads(result)
+    pd.util.testing.assert_equal(res, df)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", msg_sizes)
+@pytest.mark.parametrize("dtype", dtypes)
+async def test_send_recv_pandas(size, dtype):
+    pd = pytest.importorskip('pandas')
+    np = pytest.importorskip('numpy')
+    data = np.arange(size, dtype=dtype)
+    msg = pd.DataFrame({'a': data, 'b': data})
+    alloc_size = len(msg)
+
+    async with echo_pair() as (_, client):
+        print('Sending Metadata')
+        await client.send_obj(bytes(str(alloc_size), encoding='utf-8'))
+        print('Sending Pandas')
+        await client.send_obj(msg)
+        print('Receiving Data')
+        resp = await client.recv_obj(alloc_size)
+        result = ucp.get_obj_from_msg(resp)
+
+    res = pickle.loads(result)
+    pd.util.testing.assert_equal(res, df)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", msg_sizes)
+@pytest.mark.parametrize("dtype", dtypes)
+async def test_send_recv_pandas(size, dtype):
+    pd = pytest.importorskip('pandas')
+    np = pytest.importorskip('numpy')
+    data = np.arange(size, dtype=dtype)
+    msg = pd.DataFrame({'a': data, 'b': data})
+    alloc_size = len(msg)
+
+    async with echo_pair() as (_, client):
+        print('Sending Metadata')
+        await client.send_obj(bytes(str(alloc_size), encoding='utf-8'))
+        print('Sending Pandas')
+        await client.send_obj(msg)
+        print('Receiving Data')
+        resp = await client.recv_obj(alloc_size)
+        result = ucp.get_obj_from_msg(resp)
+
+    res = pickle.loads(result)
+    pd.util.testing.assert_equal(res, df)
+
+
+@pytest.mark.asyncio
+async def test_send_recv_bytearray():
+    frame = bytearray()
+    frame.extend(b'happy day')
+    frame.extend(b'calloo callay')
+    msg = frame
+    alloc_size = len(msg)
+    async with echo_pair() as (_, client):
+        await client.send_obj(bytes(str(alloc_size), encoding='utf-8'))
+        await client.send_obj(msg)
+        resp = await client.recv_obj(alloc_size)
+        result = ucp.get_obj_from_msg(resp)
+
+    assert bytes(msg) == bytes(result)
