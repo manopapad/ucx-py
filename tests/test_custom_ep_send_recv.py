@@ -10,12 +10,6 @@ import pandas as pd
 @pytest.mark.parametrize(
     "g",
     [
-        lambda cudf: pd.Series(),
-        lambda cudf: pd.DataFrame(),
-        lambda cudf: pd.Series([1]),
-        lambda cudf: pd.DataFrame({'a': []}),
-        lambda cudf: pd.DataFrame({'a': [], 'b': []}),
-        lambda cudf: pd.DataFrame({'a': [1.0], 'b': [2.0]}),
         lambda cudf: cudf.Series([1, 2, 3]),
         lambda cudf: cudf.Series([1, 2, 3], index=[4, 5, 6]),
         lambda cudf: cudf.Series([1, None, 3]),
@@ -26,10 +20,11 @@ import pandas as pd
         lambda cudf: cudf.Series(),
         lambda cudf: cudf.DataFrame(),
         lambda cudf: cudf.DataFrame({'a': [], 'b': []}),
+        lambda cudf: cudf.DataFrame({'a': [1], 'b': [2]}).head(0),
         lambda cudf: cudf.DataFrame({'a': [1.0], 'b': [2.0]}),
     ]
 )
-async def test_send_recv_df(event_loop, g):
+async def test_send_recv_cudf(event_loop, g):
     # requires numba=0.45 (.nbytes)
     # or fix nbytes in distributed
     cudf = pytest.importorskip('cudf')
