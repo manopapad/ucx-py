@@ -3,6 +3,7 @@ import pytest
 import ucp
 import numpy as np
 
+from utils import device_name
 
 async def hello(ep):
     msg2send = np.arange(10)
@@ -18,8 +19,8 @@ async def server_node(ep):
     await hello(ep)
 
 
-async def client_node(port):
-    ep = await ucp.create_endpoint(ucp.get_address(), port)
+async def client_node(port, device_name):
+    ep = await ucp.create_endpoint(ucp.get_address(device_name), port)
     await hello(ep)
 
 
