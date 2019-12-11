@@ -12,6 +12,7 @@ dependencies:
 - nbsphinx
 - numpydoc
 - numactl-cos6-x86_64
+- numactl-devel-cos6-x86_64
 - ucx-proc=*=cpu
 - recommonmark
 - pandoc=<2.0.0
