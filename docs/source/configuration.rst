@@ -53,6 +53,10 @@ This is a UCX CUDA Memory optimization which enables/disables a remote endpoint 
 
 Values: n/y
 
+``UCX_RNDV_THRESHOLD``
+
+This is a configurable parameter used by UCX to help determine which transport method should be used.  For example, on machines with multiple GPUs, and with NVLink enabled, UCX can deliver messages either through TCP or NVLink.  Sending GPU buffers over TCP is costly as it triggers a device-to-host on the sender side, and then host-to-device transfer on the receiver side --  we want to avoid these kinds of transfers when NVLink is available.  If a buffer is below the threshold, `Rendezvous-Protocol <https://github.com/openucx/ucx/wiki/Rendezvous-Protocol>`_ is triggered and for UCX-Py users, this will typically mean messages will be delivered through TCP.  Depending on the application, messages can be quite small, therefore, we recommend setting a small value if the application uses NVLink or InfiniBand: ``UCX_RNDV_THRESHOLD=8192``
+
 
 ``UCX_RNDV_SCHEME``
 
@@ -69,11 +73,28 @@ Values:
 
 Transport Methods (Simplified):
 
-- ``rc`` -> InfiniBand (ibv_post_send, ibv_post_recv, ibv_poll_cq)
+- ``all`` -> use all the available transports
+- ``rc`` -> InfiniBand (ibv_post_send, ibv_post_recv, ibv_poll_cq) uses rc_v and rc_x (preferably if available)
 - ``cuda_copy`` -> cuMemHostRegister, cuMemcpyAsync
 - ``cuda_ipc`` -> CUDA Interprocess Communication (cuIpcCloseMemHandle, cuIpcOpenMemHandle, cuMemcpyAsync)
 - ``sockcm`` -> connection management over sockets
-- ``tcp`` -> TCP over sockets (often used with sockcm)
+- ``sm/shm`` -> all shared memory transports (mm, cma, knem)
+- ``mm`` -> shared memory transports - only memory mappers
+- ``ugni`` -> ugni_smsg and ugni_rdma (uses ugni_udt for bootstrap)
+- ``ib`` -> all infiniband transports (rc/rc_mlx5, ud/ud_mlx5, dc_mlx5)
+- ``rc_v`` -> rc verbs (uses ud for bootstrap)
+- ``rc_x`` -> rc with accelerated verbs (uses ud_mlx5 for bootstrap)
+- ``ud_v`` -> ud verbs
+- ``ud_x`` -> ud with accelerated verbs
+- ``ud  `` -> ud_v and ud_x (preferably if available)
+- ``dc/dc_x`` -> dc with accelerated verbs
+- ``tcp`` -> sockets over TCP/IP
+- ``cuda`` -> CUDA (NVIDIA GPU) memory support
+- ``rocm`` -> ROCm (AMD GPU) memory support
+
+``SOCKADDR_TLS_PRIORITY``
+
+Priority of sockaddr transports
 
 
 InfiniBand Device
