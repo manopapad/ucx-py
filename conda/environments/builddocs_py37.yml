@@ -1,5 +1,6 @@
 name: ucx_dev
 channels:
+- quasiben
 - rapidsai
 - nvidia
 - conda-forge
@@ -10,14 +11,12 @@ dependencies:
 - sphinxcontrib-websupport
 - nbsphinx
 - numpydoc
-- numactl-cos6-x86_64
-- numactl-devel-cos6-x86_64
 - ucx-proc=*=cpu
 - recommonmark
 - pandoc=<2.0.0
 - pip
 - libhwloc
 - ucx
-- ucx-py
+- ucx-py=>0.4
 - pip:
   - sphinx-markdown-tables
