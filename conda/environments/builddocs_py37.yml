@@ -1,7 +1,6 @@
 name: ucx_dev
 channels:
 - quasiben
-- rapidsai
 - conda-forge
 dependencies:
 # required for building docs
