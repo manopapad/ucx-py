@@ -2,7 +2,6 @@ name: ucx_dev
 channels:
 - quasiben
 - rapidsai
-- nvidia
 - conda-forge
 dependencies:
 # required for building docs
