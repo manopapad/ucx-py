@@ -2,6 +2,7 @@ name: ucx_dev
 channels:
 - quasiben
 - conda-forge
+- rapidsai-nightly
 dependencies:
 # required for building docs
 - sphinx
