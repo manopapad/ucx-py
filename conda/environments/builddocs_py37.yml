@@ -16,5 +16,6 @@ dependencies:
 - libhwloc
 - ucx
 - ucx-proc=*=cpu
+- cython
 - pip:
   - sphinx-markdown-tables
