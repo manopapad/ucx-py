@@ -17,4 +17,3 @@ dependencies:
 - ucx-proc=*=cpu
 - pip:
   - sphinx-markdown-tables
-  - git+https://github.com/rapidsai/ucx-py.git
