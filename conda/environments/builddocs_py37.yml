@@ -2,7 +2,6 @@ name: ucx_dev
 channels:
 - quasiben
 - conda-forge
-- rapidsai-nightly
 dependencies:
 # required for building docs
 - sphinx
@@ -15,6 +14,7 @@ dependencies:
 - pip
 - libhwloc
 - ucx
+- ucx-proc=*=cpu
 - pip:
   - sphinx-markdown-tables
   - git+https://github.com/rapidsai/ucx-py.git
