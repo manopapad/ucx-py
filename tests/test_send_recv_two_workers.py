@@ -1,22 +1,27 @@
 import asyncio
 import multiprocessing
 import os
+import random
 
 from distributed.comm.utils import from_frames, to_frames
 from distributed.protocol import to_serialize
 from distributed.utils import nbytes
 
 import cloudpickle
+import cudf.tests.utils
 import numpy as np
 import pytest
-import rmm
 import ucp
-from utils import more_than_two_gpus
+from utils import get_cuda_devices, get_num_gpus
 
 cmd = "nvidia-smi nvlink --setcontrol 0bz"  # Get output in bytes
 # subprocess.check_call(cmd, shell=True)
 
-pynvml = pytest.importorskip("pynvml", reason="PYNVML not installed")
+pynvml = pytest.importorskip("pynvml")
+cupy = pytest.importorskip("cupy")
+rmm = pytest.importorskip("rmm")
+
+
 ITERATIONS = 1
 
 
@@ -30,21 +35,13 @@ async def get_ep(name, port):
     return ep
 
 
-def create_cuda_context():
-    import numba.cuda
-
-    numba.cuda.current_context()
-
-
-def client(env, port, func):
+def client(port, func):
     # wait for server to come up
     # receive cudf object
     # deserialize
     # assert deserialized msg is cdf
     # send receipt
 
-    ucp.reset()
-    os.environ.update(env)
     ucp.init()
 
     # must create context before importing
@@ -116,21 +113,16 @@ def client(env, port, func):
     cuda_obj_generator = cloudpickle.loads(func)
     pure_cuda_obj = cuda_obj_generator()
 
-    from cudf.tests.utils import assert_eq
-    import cupy
-
     if isinstance(rx_cuda_obj, cupy.ndarray):
         cupy.testing.assert_allclose(rx_cuda_obj, pure_cuda_obj)
     else:
-        assert_eq(rx_cuda_obj, pure_cuda_obj)
+        cudf.tests.utils.assert_eq(rx_cuda_obj, pure_cuda_obj)
 
 
-def server(env, port, func):
+def server(port, func):
     # create listener receiver
     # write cudf object
     # confirm message is sent correctly
-    ucp.reset()
-    os.environ.update(env)
     ucp.init()
 
     async def f(listener_port):
@@ -210,7 +202,7 @@ def empty_dataframe():
     return cudf.DataFrame({"a": [1.0], "b": [1.0]}).head(0)
 
 
-def cupy():
+def cupy_obj():
     import cupy
 
     size = 10 ** 8
@@ -218,20 +210,19 @@ def cupy():
 
 
 @pytest.mark.skipif(
-    not more_than_two_gpus(), reason="Machine does not have more than two GPUs"
+    get_num_gpus() <= 2, reason="Machine does not have more than two GPUs"
 )
 @pytest.mark.parametrize(
-    "cuda_obj_generator", [dataframe, empty_dataframe, series, cupy]
+    "cuda_obj_generator", [dataframe, empty_dataframe, series, cupy_obj]
 )
 def test_send_recv_cu(cuda_obj_generator):
-    import os
-
     base_env = os.environ
-    env1 = base_env.copy()
-    env2 = base_env.copy()
+    env_client = base_env.copy()
+    # grab first two devices
+    cvd = get_cuda_devices()[:2]
+    cvd = ",".join(map(str, cvd))
     # reverse CVD for other worker
-    env2["CUDA_VISIBLE_DEVICES"] = base_env["CUDA_VISIBLE_DEVICES"][::-1]
-    import random
+    env_client["CUDA_VISIBLE_DEVICES"] = cvd[::-1]
 
     port = random.randint(13000, 15500)
     # serialize function and send to the client and server
@@ -242,10 +233,14 @@ def test_send_recv_cu(cuda_obj_generator):
 
     func = cloudpickle.dumps(cuda_obj_generator)
     ctx = multiprocessing.get_context("spawn")
-    server_process = ctx.Process(name="server", target=server, args=[env1, port, func])
-    client_process = ctx.Process(name="client", target=client, args=[env2, port, func])
+    server_process = ctx.Process(name="server", target=server, args=[port, func])
+    client_process = ctx.Process(name="client", target=client, args=[port, func])
 
     server_process.start()
+    # cudf will ping the driver for validity of device
+    # this will influence device on which a cuda context is created.
+    # work around is to update env with new CVD before spawning
+    os.environ.update(env_client)
     client_process.start()
 
     server_process.join()
@@ -256,17 +251,8 @@ def test_send_recv_cu(cuda_obj_generator):
 
 
 def total_nvlink_transfer():
-    import pynvml
-
-    pynvml.nvmlShutdown()
-
     pynvml.nvmlInit()
-
-    try:
-        cuda_dev_id = int(os.environ["CUDA_VISIBLE_DEVICES"].split(",")[0])
-    except Exception as e:
-        print(e)
-        cuda_dev_id = 0
+    cuda_dev_id = int(get_cuda_devices()[0])
     nlinks = pynvml.NVML_NVLINK_MAX_LINKS
     handle = pynvml.nvmlDeviceGetHandleByIndex(cuda_dev_id)
     rx = 0

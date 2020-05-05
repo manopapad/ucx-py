@@ -6,6 +6,7 @@ channels:
 dependencies:
 # required for building docs
 - sphinx
+- sphinx-markdown-tables
 - sphinx_rtd_theme
 - sphinxcontrib-websupport
 - nbsphinx
@@ -13,9 +14,7 @@ dependencies:
 - recommonmark
 - pandoc=<2.0.0
 - pip
+- psutil
 - libhwloc
 - ucx
-- ucx-proc=*=cpu
-- cython
-- pip:
-  - sphinx-markdown-tables
+- ucx-py
