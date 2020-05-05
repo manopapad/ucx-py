@@ -18,3 +18,5 @@ dependencies:
 - libhwloc
 - ucx
 - ucx-py
+- ucx-proc=*=cpu
+- cython
