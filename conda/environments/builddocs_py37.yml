@@ -1,8 +1,8 @@
 name: ucx_dev
 channels:
 - quasiben
-- conda-forge
 - rapidsai-nightly
+- conda-forge
 dependencies:
 # required for building docs
 - sphinx
@@ -17,6 +17,5 @@ dependencies:
 - psutil
 - libhwloc
 - ucx
-- ucx-py
 - ucx-proc=*=cpu
 - cython
