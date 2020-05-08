@@ -16,6 +16,6 @@ dependencies:
 - pip
 - psutil
 - libhwloc
-- ucx
+- ucx=1.8.0dev+nonuma
 - ucx-proc=*=cpu
 - cython
