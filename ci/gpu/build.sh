@@ -49,7 +49,6 @@ conda install "cudatoolkit=$CUDA_REL" \
               "cupy>=6.5.0" "numpy>=1.16" \
               "cudf=${MINOR_VERSION}" "dask-cudf=${MINOR_VERSION}" \
               "dask>=2.8.1" "distributed>=2.8.1" \
-              "pyarrow=0.15.0" "arrow-cpp=0.15.0" \
               -c rapidsai-nightly
 
 # needed for asynccontextmanager in py36
@@ -126,7 +125,7 @@ else
 
     # Test with TCP/Sockets
     logger "TEST WITH TCP ONLY..."
-    py.test --cache-clear -vs --ignore-glob tests/test_send_recv_two_workers.py --ignore-glob tests/debug-tests/test_send_recv_many_workers.py tests/debug-tests/test_send_recv_many_workers.py tests/
+    py.test --cache-clear -vs --ignore-glob tests/test_send_recv_two_workers.py tests/
 
     # Test downstream packages, which requires Python v3.7
     if [ $(python -c "import sys; print(sys.version_info[1])") -ge "7" ]; then
