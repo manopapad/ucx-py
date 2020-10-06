@@ -10,13 +10,13 @@ import weakref
 from posix.stdio cimport open_memstream
 
 from cpython.ref cimport Py_DECREF, Py_INCREF, PyObject
-from libc.stdint cimport uintptr_t
-from libc.stdio cimport FILE, fclose, fflush
+from libc.stdint cimport uint16_t, uintptr_t
+from libc.stdio cimport FILE, clearerr, fclose, fflush
 from libc.stdlib cimport free
 from libc.string cimport memset
 
+from .arr cimport Array
 from .ucx_api_dep cimport *
-from .utils cimport get_buffer_data
 
 from ..exceptions import (
     UCXCanceled,
@@ -31,7 +31,7 @@ from ..utils import nvtx_annotate
 # Struct used as requests by UCX
 cdef struct ucx_py_request:
     bint finished  # Used by downstream projects such as cuML
-    int uid
+    unsigned int uid
     PyObject *info
 
 
@@ -44,16 +44,20 @@ cdef void ucx_py_request_reset(void* request):
     req.info = NULL
 
 # Counter used as UCXRequest UIDs
-cdef int _ucx_py_request_counter = 0
+cdef unsigned int _ucx_py_request_counter = 0
 
 
 logger = logging.getLogger("ucx")
 
 
-cdef assert_ucs_status(ucs_status_t status, msg_context=None):
+cdef void assert_ucs_status(ucs_status_t status, str msg_context=None) except *:
+    cdef str msg, ucs_status
     if status != UCS_OK:
-        msg = "[%s] " % msg_context if msg_context is not None else ""
-        msg += ucs_status_string(status).decode("utf-8")
+        ucs_status = ucs_status_string(status).decode("utf-8")
+        if msg_context is not None:
+            msg = f"[{msg_context}] {ucs_status}"
+        else:
+            msg = ucs_status
         raise UCXError(msg)
 
 
@@ -64,22 +68,30 @@ cdef ucp_config_t * _read_ucx_config(dict user_options) except *:
     """
     cdef ucp_config_t *config
     cdef ucs_status_t status
+    cdef str status_msg
     status = ucp_config_read(NULL, NULL, &config)
     if status != UCS_OK:
-        raise UCXConfigError(
-            "Couldn't read the UCX options: %s" %
-            ucs_status_string(status).decode("utf-8")
-        )
+        status_msg = ucs_status_string(status).decode("utf-8")
+        raise UCXConfigError(f"Couldn't read the UCX options: {status_msg}")
 
     # Modify the UCX configuration options based on `config_dict`
-    for k, v in user_options.items():
-        status = ucp_config_modify(config, k.encode(), v.encode())
-        if status == UCS_ERR_NO_ELEM:
-            raise UCXConfigError("Option %s doesn't exist" % k)
-        elif status != UCS_OK:
-            msg = "Couldn't set option %s to %s: %s" % \
-                  (k, v, ucs_status_string(status).decode("utf-8"))
-            raise UCXConfigError(msg)
+    cdef str k, v
+    cdef bytes kb, vb
+    try:
+        for k, v in user_options.items():
+            kb = k.encode()
+            vb = v.encode()
+            status = ucp_config_modify(config, <const char*>kb, <const char*>vb)
+            if status == UCS_ERR_NO_ELEM:
+                raise UCXConfigError(f"Option {k} doesn't exist")
+            elif status != UCS_OK:
+                status_msg = ucs_status_string(status).decode("utf-8")
+                raise UCXConfigError(
+                    f"Couldn't set option {k} to {v}: {status_msg}"
+                )
+    except Exception:
+        ucp_config_release(config)
+        raise
     return config
 
 
@@ -87,22 +99,27 @@ cdef dict ucx_config_to_dict(ucp_config_t *config):
     """Returns a dict of a UCX config"""
     cdef char *text
     cdef size_t text_len
-    cdef unicode py_text
+    cdef unicode py_text, line, k, v
     cdef FILE *text_fd = open_memstream(&text, &text_len)
-    if(text_fd == NULL):
+    if text_fd == NULL:
         raise IOError("open_memstream() returned NULL")
     cdef dict ret = {}
     ucp_config_print(config, text_fd, NULL, UCS_CONFIG_PRINT_CONFIG)
-    fflush(text_fd)
     try:
+        if fflush(text_fd) != 0:
+            clearerr(text_fd)
+            raise IOError("fflush() failed on memory stream")
         py_text = text.decode()
         for line in py_text.splitlines():
             k, v = line.split("=")
-            k = k[len("UCX_"):]
+            k = k[4:]  # Strip "UCX_" prefix
             ret[k] = v
     finally:
-        fclose(text_fd)
-        free(text)
+        if fclose(text_fd) != 0:
+            free(text)
+            raise IOError("fclose() failed to close memory stream")
+        else:
+            free(text)
     return ret
 
 
@@ -112,9 +129,10 @@ def get_current_options():
     if UCX were to be initialized now.
     """
     cdef ucp_config_t *config = _read_ucx_config({})
-    ret = ucx_config_to_dict(config)
-    ucp_config_release(config)
-    return ret
+    try:
+        return ucx_config_to_dict(config)
+    finally:
+        ucp_config_release(config)
 
 
 def get_ucx_version():
@@ -151,7 +169,7 @@ cdef class UCXObject:
         # List of weak references of UCX objects that make use of this object
         self._children = []
 
-    def close(self):
+    cpdef void close(self) except *:
         """Close the object and free the underlying UCX handle.
         Does nothing if the object is already closed
         """
@@ -163,7 +181,7 @@ cdef class UCXObject:
         """Is the underlying UCX handle initialized"""
         return self._finalizer and self._finalizer.alive
 
-    def add_child(self, child):
+    cpdef void add_child(self, child) except *:
         """Add a UCX object to this object's children. The underlying UCX
         handle will be freed when this obejct is freed.
         """
@@ -190,6 +208,7 @@ cdef class UCXContext(UCXObject):
     cdef:
         ucp_context_h _handle
         dict _config
+        readonly bint cuda_support
 
     def __init__(self, config_dict):
         cdef ucp_params_t ucp_params
@@ -213,22 +232,28 @@ cdef class UCXContext(UCXObject):
         )
 
         cdef ucp_config_t *config = _read_ucx_config(config_dict)
-        status = ucp_init(&ucp_params, config, &self._handle)
-        assert_ucs_status(status)
+        try:
+            status = ucp_init(&ucp_params, config, &self._handle)
+            assert_ucs_status(status)
+            self._config = ucx_config_to_dict(config)
+        finally:
+            ucp_config_release(config)
+
+        # UCX supports CUDA if "cuda" is part of the TLS or TLS is "all"
+        cdef str tls = self._config["TLS"]
+        self.cuda_support = tls == "all" or "cuda" in tls
 
         self.add_handle_finalizer(
             _ucx_context_handle_finalizer,
             int(<uintptr_t>self._handle)
         )
 
-        self._config = ucx_config_to_dict(config)
-        ucp_config_release(config)
-
         logger.info("UCP initiated using config: ")
+        cdef str k, v
         for k, v in self._config.items():
-            logger.info("  %s: %s" % (k, v))
+            logger.info(f"  {k}: {v}")
 
-    def get_config(self):
+    cpdef dict get_config(self):
         return self._config
 
     @property
@@ -238,8 +263,8 @@ cdef class UCXContext(UCXObject):
 
 
 cdef void _ib_err_cb(void *arg, ucp_ep_h ep, ucs_status_t status):
-    status_str = ucs_status_string(status).decode("utf-8")
-    msg = (
+    cdef str status_str = ucs_status_string(status).decode("utf-8")
+    cdef str msg = (
         "Endpoint %s failed with status %d: %s" % (
             hex(int(<uintptr_t>ep)), status, status_str
         )
@@ -247,24 +272,37 @@ cdef void _ib_err_cb(void *arg, ucp_ep_h ep, ucs_status_t status):
     logger.error(msg)
 
 
-cdef ucp_err_handler_cb_t _get_error_callback(tls, endpoint_error_handling):
+cdef ucp_err_handler_cb_t _get_error_callback(
+    str tls, bint endpoint_error_handling
+) except *:
     cdef ucp_err_handler_cb_t err_cb = <ucp_err_handler_cb_t>NULL
-    if endpoint_error_handling and any(t in tls for t in ["dc", "ib", "rc"]):
-        err_cb = <ucp_err_handler_cb_t>_ib_err_cb
+    cdef str t
+    cdef list transports
+    if endpoint_error_handling:
+        transports = ["dc", "ib", "rc"]
+        for t in transports:
+            if t in tls:
+                err_cb = <ucp_err_handler_cb_t>_ib_err_cb
+                break
     return err_cb
 
 
 def _ucx_worker_handle_finalizer(
-    uintptr_t handle_as_int, UCXContext ctx, inflight_msgs
+    uintptr_t handle_as_int, UCXContext ctx, set inflight_msgs
 ):
     assert ctx.initialized
     cdef ucp_worker_h handle = <ucp_worker_h>handle_as_int
 
     # Cancel all inflight messages
+    cdef UCXRequest req
+    cdef dict req_info
+    cdef str name
     for req in list(inflight_msgs):
         assert not req.closed()
-        logger.debug("Future cancelling: %s" % req.info["name"])
-        ucp_request_cancel(handle, <void*><uintptr_t>req.handle)
+        req_info = <dict>req._handle.info
+        name = req_info["name"]
+        logger.debug("Future cancelling: %s" % name)
+        ucp_request_cancel(handle, <void*>req._handle)
 
     ucp_worker_destroy(handle)
 
@@ -321,7 +359,7 @@ cdef class UCXWorker(UCXObject):
             raise IOError("epoll_ctl() returned %d" % err)
         return epoll_fd
 
-    def arm(self):
+    cpdef bint arm(self) except *:
         assert self.initialized
         cdef ucs_status_t status
         status = ucp_worker_arm(self._handle)
@@ -341,7 +379,7 @@ cdef class UCXWorker(UCXObject):
         assert self.initialized
         return int(<uintptr_t>self._handle)
 
-    def request_cancel(self, UCXRequest req):
+    cpdef void request_cancel(self, UCXRequest req) except *:
         assert self.initialized
         assert not req.closed()
 
@@ -349,7 +387,7 @@ cdef class UCXWorker(UCXObject):
         # which will handle the request cleanup.
         ucp_request_cancel(self._handle, req._handle)
 
-    def ep_create(self, str ip_address, port, endpoint_error_handling):
+    def ep_create(self, str ip_address, uint16_t port, bint endpoint_error_handling):
         assert self.initialized
         cdef ucp_ep_params_t params
         ip_address = socket.gethostbyname(ip_address)
@@ -368,7 +406,7 @@ cdef class UCXWorker(UCXObject):
         return UCXEndpoint(self, <uintptr_t>ucp_ep)
 
     def ep_create_from_conn_request(
-        self, uintptr_t conn_request, endpoint_error_handling
+        self, uintptr_t conn_request, bint endpoint_error_handling
     ):
         assert self.initialized
 
@@ -387,19 +425,26 @@ cdef class UCXWorker(UCXObject):
         return UCXEndpoint(self, <uintptr_t>ucp_ep)
 
 
-def _ucx_endpoint_finalizer(uintptr_t handle_as_int, worker, inflight_msgs):
+def _ucx_endpoint_finalizer(uintptr_t handle_as_int, worker, set inflight_msgs):
     assert worker.initialized
     cdef ucp_ep_h handle = <ucp_ep_h>handle_as_int
     cdef ucs_status_ptr_t status
 
     # Cancel all inflight messages
+    cdef UCXRequest req
+    cdef dict req_info
+    cdef str name
     for req in list(inflight_msgs):
-        logger.debug("Future cancelling: %s" % req.info["name"])
+        assert not req.closed()
+        req_info = <dict>req._handle.info
+        name = req_info["name"]
+        logger.debug("Future cancelling: %s" % name)
         # Notice, `request_cancel()` evoke the send/recv callback functions
         worker.request_cancel(req)
 
     # Close the endpoint
     # TODO: Support UCP_EP_CLOSE_MODE_FORCE
+    cdef str msg
     status = ucp_ep_close_nb(handle, UCP_EP_CLOSE_MODE_FLUSH)
     if UCS_PTR_IS_PTR(status):
         ucp_request_free(status)
@@ -440,15 +485,20 @@ cdef class UCXEndpoint(UCXObject):
         cdef size_t text_len
         cdef unicode py_text
         cdef FILE *text_fd = open_memstream(&text, &text_len)
-        if(text_fd == NULL):
+        if text_fd == NULL:
             raise IOError("open_memstream() returned NULL")
         ucp_ep_print_info(self._handle, text_fd)
-        fflush(text_fd)
         try:
+            if fflush(text_fd) != 0:
+                clearerr(text_fd)
+                raise IOError("fflush() failed on memory stream")
             py_text = text.decode()
         finally:
-            fclose(text_fd)
-            free(text)
+            if fclose(text_fd) != 0:
+                free(text)
+                raise IOError("fclose() failed to close memory stream")
+            else:
+                free(text)
         return py_text
 
     @property
@@ -480,16 +530,20 @@ cdef class UCXListener(UCXObject):
         dict cb_data
 
     cdef public:
-        int port
+        uint16_t port
 
     def __init__(
         self,
         UCXWorker worker,
-        port,
+        uint16_t port,
         cb_func,
-        cb_args=tuple(),
-        cb_kwargs=dict()
+        tuple cb_args=None,
+        dict cb_kwargs=None
     ):
+        if cb_args is None:
+            cb_args = ()
+        if cb_kwargs is None:
+            cb_kwargs = {}
         cdef ucp_listener_params_t params
         cdef ucp_listener_conn_callback_t _listener_cb = (
             <ucp_listener_conn_callback_t>_listener_callback
@@ -537,7 +591,7 @@ cdef class UCXRequest:
     """
     cdef:
         ucx_py_request *_handle
-        int _uid
+        unsigned int _uid
 
     def __init__(self, uintptr_t req_as_int):
         global _ucx_py_request_counter
@@ -556,10 +610,10 @@ cdef class UCXRequest:
         else:
             self._uid = self._handle.uid
 
-    def closed(self):
+    cpdef bint closed(self):
         return self._handle == NULL or self._uid != self._handle.uid
 
-    def close(self):
+    cpdef void close(self) except *:
         """This routine releases the non-blocking request back to UCX,
         regardless of its current state. Communications operations associated with
         this request will make progress internally, however no further notifications or
@@ -601,29 +655,34 @@ cdef class UCXRequest:
             )
 
 
-cdef _handle_status(
+cdef UCXRequest _handle_status(
     ucs_status_ptr_t status,
     int64_t expected_receive,
     cb_func,
     cb_args,
     cb_kwargs,
-    name,
-    inflight_msgs
+    unicode name,
+    set inflight_msgs
 ):
     if UCS_PTR_STATUS(status) == UCS_OK:
         return
-    msg = "<%s>: " % name
+    cdef str ucx_status_msg, msg
     if UCS_PTR_IS_ERR(status):
-        msg += ucs_status_string(UCS_PTR_STATUS(status)).decode("utf-8")
+        ucx_status_msg = (
+            ucs_status_string(UCS_PTR_STATUS(status)).decode("utf-8")
+        )
+        msg = "<%s>: %s" % (name, ucx_status_msg)
         raise UCXError(msg)
-    req = UCXRequest(<uintptr_t><void*> status)
-    if req.info["status"] == "finished":
+    cdef UCXRequest req = UCXRequest(<uintptr_t><void*> status)
+    assert not req.closed()
+    cdef dict req_info = <dict>req._handle.info
+    if req_info["status"] == "finished":
         try:
-            # The callback function has already handle the request
-            received = req.info.get("received", None)
+            # The callback function has already handled the request
+            received = req_info.get("received", None)
             if received is not None and received != expected_receive:
-                msg += "length mismatch: %d (got) != %d (expected)" % (
-                    received, expected_receive
+                msg = "<%s>: length mismatch: %d (got) != %d (expected)" % (
+                    name, received, expected_receive
                 )
                 raise UCXMsgTruncated(msg)
             else:
@@ -632,41 +691,54 @@ cdef _handle_status(
         finally:
             req.close()
     else:
-        req.info["cb_func"] = cb_func
-        req.info["cb_args"] = cb_args
-        req.info["cb_kwargs"] = cb_kwargs
-        req.info["expected_receive"] = expected_receive
-        req.info["name"] = name
+        req_info["cb_func"] = cb_func
+        req_info["cb_args"] = cb_args
+        req_info["cb_kwargs"] = cb_kwargs
+        req_info["expected_receive"] = expected_receive
+        req_info["name"] = name
         inflight_msgs.add(req)
-        req.info["inflight_msgs"] = inflight_msgs
+        req_info["inflight_msgs"] = inflight_msgs
         return req
 
 
 cdef void _send_callback(void *request, ucs_status_t status):
+    cdef UCXRequest req
+    cdef dict req_info
+    cdef str name, ucx_status_msg, msg
+    cdef set inflight_msgs
+    cdef tuple cb_args
+    cdef dict cb_kwargs
     with log_errors():
         req = UCXRequest(<uintptr_t><void*> request)
-        req.info["status"] = "finished"
+        assert not req.closed()
+        req_info = <dict>req._handle.info
+        req_info["status"] = "finished"
 
-        if "cb_func" not in req.info:
+        if "cb_func" not in req_info:
             # This callback function was called before ucp_tag_send_nb() returned
             return
 
-        msg = "<%s>: " % req.info["name"]
+        exception = None
         if status == UCS_ERR_CANCELED:
+            name = req_info["name"]
+            msg = "<%s>: " % name
             exception = UCXCanceled(msg)
         elif status != UCS_OK:
-            msg += ucs_status_string(status).decode("utf-8")
+            name = req_info["name"]
+            ucx_status_msg = ucs_status_string(status).decode("utf-8")
+            msg = "<%s>: %s" % (name, ucx_status_msg)
             exception = UCXError(msg)
-        else:
-            exception = None
         try:
-            req.info["inflight_msgs"].discard(req)
-            cb_func = req.info["cb_func"]
+            inflight_msgs = req_info["inflight_msgs"]
+            inflight_msgs.discard(req)
+            cb_func = req_info["cb_func"]
             if cb_func is not None:
-                cb_args = req.info["cb_args"]
-                cb_args = cb_args if cb_args else tuple()
-                cb_kwargs = req.info["cb_kwargs"]
-                cb_kwargs = cb_kwargs if cb_kwargs else dict()
+                cb_args = req_info["cb_args"]
+                if cb_args is None:
+                    cb_args = ()
+                cb_kwargs = req_info["cb_kwargs"]
+                if cb_kwargs is None:
+                    cb_kwargs = {}
                 cb_func(req, exception, *cb_args, **cb_kwargs)
         finally:
             req.close()
@@ -674,13 +746,13 @@ cdef void _send_callback(void *request, ucs_status_t status):
 
 def tag_send_nb(
     UCXEndpoint ep,
-    buffer,
+    Array buffer,
     size_t nbytes,
     ucp_tag_t tag,
     cb_func,
-    cb_args=tuple(),
-    cb_kwargs=dict(),
-    name="tag_send_nb"
+    tuple cb_args=None,
+    dict cb_kwargs=None,
+    str name=None
 ):
     """ This routine sends a message to a destination endpoint
 
@@ -703,12 +775,8 @@ def tag_send_nb(
     ----------
     ep: UCXEndpoint
         The destination endpoint
-    buffer: object
-        The buffer object, which must support one of the following protocols and
-        is checked in order:
-            1) Numba's CUDA Array Interface: `__cuda_array_interface__`
-            2) Numpy's Array Interface: `__array_interface__`
-            3) Python buffer protocol: `memoryview()`
+    buffer: Array
+        An ``Array`` wrapping a user-provided array-like object
     nbytes: int
         Size of the buffer to use. Must be equal or less than the size of buffer
     tag: int
@@ -723,11 +791,27 @@ def tag_send_nb(
     name: str, optional
         Descriptive name of the operation
     """
-    cdef void *data = <void*>get_buffer_data(buffer, check_writable=False)
+    if cb_args is None:
+        cb_args = ()
+    if cb_kwargs is None:
+        cb_kwargs = {}
+    if name is None:
+        name = "tag_send_nb"
+    if buffer.cuda and not ep.worker._context.cuda_support:
+        raise ValueError(
+            "UCX is not configured with CUDA support, please add "
+            "`cuda_copy` and/or `cuda_ipc` to the UCX_TLS environment"
+            "variable and that the ucx-proc=*=gpu package is "
+            "installed. See "
+            "https://ucx-py.readthedocs.io/en/latest/install.html for "
+            "more information."
+        )
+    if not buffer._contiguous():
+        raise ValueError("Array must be C or F contiguous")
     cdef ucp_send_callback_t _send_cb = <ucp_send_callback_t>_send_callback
     cdef ucs_status_ptr_t status = ucp_tag_send_nb(
         ep._handle,
-        data,
+        <void*>buffer.ptr,
         nbytes,
         ucp_dt_make_contig(1),
         tag,
@@ -741,35 +825,49 @@ def tag_send_nb(
 cdef void _tag_recv_callback(
     void *request, ucs_status_t status, ucp_tag_recv_info_t *info
 ):
+    cdef UCXRequest req
+    cdef dict req_info
+    cdef str name, ucx_status_msg, msg
+    cdef set inflight_msgs
+    cdef tuple cb_args
+    cdef dict cb_kwargs
     with log_errors():
         req = UCXRequest(<uintptr_t><void*> request)
-        req.info["status"] = "finished"
+        assert not req.closed()
+        req_info = <dict>req._handle.info
+        req_info["status"] = "finished"
 
-        if "cb_func" not in req.info:
+        if "cb_func" not in req_info:
             # This callback function was called before ucp_tag_recv_nb() returned
             return
 
-        msg = "<%s>: " % req.info["name"]
+        exception = None
         if status == UCS_ERR_CANCELED:
+            name = req_info["name"]
+            msg = "<%s>: " % name
             exception = UCXCanceled(msg)
         elif status != UCS_OK:
-            msg += ucs_status_string(status).decode("utf-8")
+            name = req_info["name"]
+            ucx_status_msg = ucs_status_string(status).decode("utf-8")
+            msg = "<%s>: %s" % (name, ucx_status_msg)
             exception = UCXError(msg)
-        elif info.length != req.info["expected_receive"]:
-            msg += "length mismatch: %d (got) != %d (expected)" % (
-                info.length, req.info["expected_receive"]
+        elif info.length != <size_t>req_info["expected_receive"]:
+            name = req_info["name"]
+            msg = "<%s>: length mismatch: %d (got) != %d (expected)" % (
+                name, info.length, req_info["expected_receive"]
             )
             exception = UCXMsgTruncated(msg)
-        else:
-            exception = None
         try:
-            req.info["inflight_msgs"].discard(req)
-            cb_func = req.info["cb_func"]
+            inflight_msgs = req_info["inflight_msgs"]
+            inflight_msgs.discard(req)
+            cb_func = req_info["cb_func"]
             if cb_func is not None:
-                cb_args = req.info["cb_args"]
-                cb_args = cb_args if cb_args else tuple()
-                cb_kwargs = req.info["cb_kwargs"]
-                cb_kwargs = cb_kwargs if cb_kwargs else dict()
+                cb_args = req_info["cb_args"]
+                if cb_args is None:
+                    cb_args = ()
+                cb_kwargs = req_info["cb_kwargs"]
+                if cb_kwargs is None:
+                    cb_kwargs = {}
                 cb_func(req, exception, *cb_args, **cb_kwargs)
         finally:
             req.close()
@@ -777,14 +875,14 @@ cdef void _tag_recv_callback(
 
 def tag_recv_nb(
     UCXWorker worker,
-    buffer,
+    Array buffer,
     size_t nbytes,
     ucp_tag_t tag,
     cb_func,
     ucp_tag_t tag_mask=-1,
-    cb_args=tuple(),
-    cb_kwargs=dict(),
-    name="tag_recv_nb",
+    tuple cb_args=None,
+    dict cb_kwargs=None,
+    str name=None,
     UCXEndpoint ep=None
 ):
     """ This routine receives a message on a worker
@@ -807,12 +905,8 @@ def tag_recv_nb(
     ----------
     worker: UCXWorker
         The worker that is used for the receive operation
-    buffer: object
-        The buffer object, which must support one of the following protocols and
-        is checked in order:
-            1) Numba's CUDA Array Interface: `__cuda_array_interface__`
-            2) Numpy's Array Interface: `__array_interface__`
-            3) Python buffer protocol: `memoryview()`
+    buffer: Array
+        An ``Array`` wrapping a user-provided array-like object
     nbytes: int
         Size of the buffer to use. Must be equal or less than the size of buffer
     tag: int
@@ -834,21 +928,46 @@ def tag_recv_nb(
         guarantee that the message is cancelled when `ep` closes as opposed to
         when the `worker` closes.
     """
-
-    cdef void *data = <void*>get_buffer_data(buffer, check_writable=True)
+    if cb_args is None:
+        cb_args = ()
+    if cb_kwargs is None:
+        cb_kwargs = {}
+    if name is None:
+        name = "tag_recv_nb"
+    if buffer.readonly:
+        raise ValueError("writing to readonly buffer!")
+    cdef bint cuda_support
+    if buffer.cuda:
+        if ep is None:
+            cuda_support = <bint>worker._context.cuda_support
+        else:
+            cuda_support = <bint>ep.worker._context.cuda_support
+        if not cuda_support:
+            raise ValueError(
+                "UCX is not configured with CUDA support, please add "
+                "`cuda_copy` and/or `cuda_ipc` to the UCX_TLS environment"
+                "variable and that the ucx-proc=*=gpu package is "
+                "installed. See "
+                "https://ucx-py.readthedocs.io/en/latest/install.html for "
+                "more information."
+            )
+    if not buffer._contiguous():
+        raise ValueError("Array must be C or F contiguous")
     cdef ucp_tag_recv_callback_t _tag_recv_cb = (
         <ucp_tag_recv_callback_t>_tag_recv_callback
     )
     cdef ucs_status_ptr_t status = ucp_tag_recv_nb(
         worker._handle,
-        data,
+        <void*>buffer.ptr,
         nbytes,
         ucp_dt_make_contig(1),
         tag,
         -1,
         _tag_recv_cb
     )
-    inflight_msgs = worker._inflight_msgs if ep is None else ep._inflight_msgs
+    cdef set inflight_msgs = (
+        worker._inflight_msgs if ep is None else ep._inflight_msgs
+    )
     return _handle_status(
         status, nbytes, cb_func, cb_args, cb_kwargs, name, inflight_msgs
     )
@@ -856,12 +975,12 @@ def tag_recv_nb(
 
 def stream_send_nb(
     UCXEndpoint ep,
-    buffer,
+    Array buffer,
     size_t nbytes,
     cb_func,
-    cb_args=tuple(),
-    cb_kwargs=dict(),
-    name="stream_send_nb"
+    tuple cb_args=None,
+    dict cb_kwargs=None,
+    str name=None
 ):
     """ This routine sends data to a destination endpoint
 
@@ -883,12 +1002,8 @@ def stream_send_nb(
     ----------
     ep: UCXEndpoint
         The destination endpoint
-    buffer: object
-        The buffer object, which must support one of the following protocols and
-        is checked in order:
-            1) Numba's CUDA Array Interface: `__cuda_array_interface__`
-            2) Numpy's Array Interface: `__array_interface__`
-            3) Python buffer protocol: `memoryview()`
+    buffer: Array
+        An ``Array`` wrapping a user-provided array-like object
     nbytes: int
         Size of the buffer to use. Must be equal or less than the size of buffer
     cb_func: callable
@@ -901,11 +1016,27 @@ def stream_send_nb(
     name: str, optional
         Descriptive name of the operation
     """
-    cdef void *data = <void*>get_buffer_data(buffer, check_writable=False)
+    if cb_args is None:
+        cb_args = ()
+    if cb_kwargs is None:
+        cb_kwargs = {}
+    if name is None:
+        name = "stream_send_nb"
+    if buffer.cuda and not ep.worker._context.cuda_support:
+        raise ValueError(
+            "UCX is not configured with CUDA support, please add "
+            "`cuda_copy` and/or `cuda_ipc` to the UCX_TLS environment"
+            "variable and that the ucx-proc=*=gpu package is "
+            "installed. See "
+            "https://ucx-py.readthedocs.io/en/latest/install.html for "
+            "more information."
+        )
+    if not buffer._contiguous():
+        raise ValueError("Array must be C or F contiguous")
     cdef ucp_send_callback_t _send_cb = <ucp_send_callback_t>_send_callback
     cdef ucs_status_ptr_t status = ucp_stream_send_nb(
         ep._handle,
-        data,
+        <void*>buffer.ptr,
         nbytes,
         ucp_dt_make_contig(1),
         _send_cb,
@@ -919,35 +1050,49 @@ def stream_send_nb(
 cdef void _stream_recv_callback(
     void *request, ucs_status_t status, size_t length
 ):
+    cdef UCXRequest req
+    cdef dict req_info
+    cdef str name, ucx_status_msg, msg
+    cdef set inflight_msgs
+    cdef tuple cb_args
+    cdef dict cb_kwargs
     with log_errors():
         req = UCXRequest(<uintptr_t><void*> request)
-        req.info["status"] = "finished"
+        assert not req.closed()
+        req_info = <dict>req._handle.info
+        req_info["status"] = "finished"
 
-        if "cb_func" not in req.info:
+        if "cb_func" not in req_info:
             # This callback function was called before ucp_tag_recv_nb() returned
             return
 
-        msg = "<%s>: " % req.info["name"]
+        exception = None
         if status == UCS_ERR_CANCELED:
+            name = req_info["name"]
+            msg = "<%s>: " % name
             exception = UCXCanceled(msg)
         elif status != UCS_OK:
-            msg += ucs_status_string(status).decode("utf-8")
+            name = req_info["name"]
+            ucx_status_msg = ucs_status_string(status).decode("utf-8")
+            msg = "<%s>: %s" % (name, ucx_status_msg)
             exception = UCXError(msg)
-        elif length != req.info["expected_receive"]:
-            msg += "length mismatch: %d (got) != %d (expected)" % (
-                length, req.info["expected_receive"]
+        elif length != req_info["expected_receive"]:
+            name = req_info["name"]
+            msg = "<%s>: length mismatch: %d (got) != %d (expected)" % (
+                name, length, req_info["expected_receive"]
             )
             exception = UCXMsgTruncated(msg)
-        else:
-            exception = None
         try:
-            req.info["inflight_msgs"].discard(req)
-            cb_func = req.info["cb_func"]
+            inflight_msgs = req_info["inflight_msgs"]
+            inflight_msgs.discard(req)
+            cb_func = req_info["cb_func"]
             if cb_func is not None:
-                cb_args = req.info["cb_args"]
-                cb_args = cb_args if cb_args else tuple()
-                cb_kwargs = req.info["cb_kwargs"]
-                cb_kwargs = cb_kwargs if cb_kwargs else dict()
+                cb_args = req_info["cb_args"]
+                if cb_args is None:
+                    cb_args = ()
+                cb_kwargs = req_info["cb_kwargs"]
+                if cb_kwargs is None:
+                    cb_kwargs = {}
                 cb_func(req, exception, *cb_args, **cb_kwargs)
         finally:
             req.close()
@@ -955,12 +1100,12 @@ cdef void _stream_recv_callback(
 
 def stream_recv_nb(
     UCXEndpoint ep,
-    buffer,
+    Array buffer,
     size_t nbytes,
     cb_func,
-    cb_args=tuple(),
-    cb_kwargs=dict(),
-    name="stream_recv_nb"
+    tuple cb_args=None,
+    dict cb_kwargs=None,
+    str name=None
 ):
     """ This routine receives data on the endpoint.
 
@@ -976,12 +1121,8 @@ def stream_recv_nb(
     ----------
     ep: UCXEndpoint
         The destination endpoint
-    buffer: object
-        The buffer object, which must support one of the following protocols and
-        is checked in order:
-            1) Numba's CUDA Array Interface: `__cuda_array_interface__`
-            2) Numpy's Array Interface: `__array_interface__`
-            3) Python buffer protocol: `memoryview()`
+    buffer: Array
+        An ``Array`` wrapping a user-provided array-like object
     nbytes: int
         Size of the buffer to use. Must be equal or less than the size of buffer
     cb_func: callable
@@ -994,15 +1135,32 @@ def stream_recv_nb(
     name: str, optional
         Descriptive name of the operation
     """
-
-    cdef void *data = <void*>get_buffer_data(buffer, check_writable=True)
+    if cb_args is None:
+        cb_args = ()
+    if cb_kwargs is None:
+        cb_kwargs = {}
+    if name is None:
+        name = "stream_recv_nb"
+    if buffer.readonly:
+        raise ValueError("writing to readonly buffer!")
+    if buffer.cuda and not ep.worker._context.cuda_support:
+        raise ValueError(
+            "UCX is not configured with CUDA support, please add "
+            "`cuda_copy` and/or `cuda_ipc` to the UCX_TLS environment"
+            "variable and that the ucx-proc=*=gpu package is "
+            "installed. See "
+            "https://ucx-py.readthedocs.io/en/latest/install.html for "
+            "more information."
+        )
+    if not buffer._contiguous():
+        raise ValueError("Array must be C or F contiguous")
     cdef size_t length
     cdef ucp_stream_recv_callback_t _stream_recv_cb = (
         <ucp_stream_recv_callback_t>_stream_recv_callback
     )
     cdef ucs_status_ptr_t status = ucp_stream_recv_nb(
         ep._handle,
-        data,
+        <void*>buffer.ptr,
         nbytes,
         ucp_dt_make_contig(1),
         _stream_recv_cb,
